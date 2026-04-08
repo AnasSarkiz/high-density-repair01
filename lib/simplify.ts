@@ -10,7 +10,7 @@ type RouteSection = {
 }
 
 const DEFAULT_TARGET_SEGMENTS = 10
-const ROUNDING_PRECISION = 1_000
+const ROUNDING_PRECISION = 10_000
 
 const roundCoordinate = (value: number) =>
   Math.round(value * ROUNDING_PRECISION) / ROUNDING_PRECISION
