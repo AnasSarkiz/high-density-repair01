@@ -5,6 +5,16 @@ import type {
   NodeWithPortPoints,
 } from "./types/high-density-types"
 import { safeTransparentize } from "./utils/colors"
+import {
+  areSameXY,
+  getCoincidentPointIndexes,
+  getInsetNodeBounds,
+  getRouteRootConnectionName,
+} from "./utils/force-improve-route-helpers"
+import {
+  getProjectionSegmentDistanceCandidates,
+  pointToProjectionSegment,
+} from "./utils/force-improve-segment-helpers"
 import { BaseSolver } from "./BaseSolver"
 
 type Vector = {
@@ -77,6 +87,27 @@ type ForceImproveSampleEntry = {
   routeIndexes: number[]
 }
 
+type ProjectionViaNode = {
+  routeIndex: number
+  rootConnectionName: string
+  pointIndexes: number[]
+  x: number
+  y: number
+  radius: number
+  movable: boolean
+}
+
+type ProjectionSegment = {
+  routeIndex: number
+  rootConnectionName: string
+  startIndex: number
+  endIndex: number
+  start: Vector
+  end: Vector
+  z: number
+  traceRadius: number
+}
+
 export type ForceVector = {
   kind: "point" | "via"
   routeIndex: number
@@ -144,7 +175,14 @@ const DEFAULT_TOTAL_STEPS_PER_NODE = 60
 
 const ROUNDING_PRECISION = 1_000
 const POSITION_EPSILON = 1e-6
+const COORDINATE_MATCH_EPSILON = 1e-3
 const BOUNDARY_INSET = 1 / ROUNDING_PRECISION
+const RELAXED_VIA_CLEARANCE = 0.1
+const RELAXED_TRACE_CLEARANCE = 0.1
+const CLEARANCE_SLACK = 0.015
+const VIA_PROJECTION_PASSES = 10
+const MAX_VIA_MOVE_PER_PASS = 0.04
+const MAX_TRACE_MOVE_PER_PASS = 0.025
 
 const roundCoordinate = (value: number) =>
   Math.round(value * ROUNDING_PRECISION) / ROUNDING_PRECISION
@@ -803,6 +841,449 @@ const materializeRoutes = (mutableRoutes: MutableRoute[]) =>
     return nextRoute
   })
 
+const clampProjectionViaToNode = (
+  via: ProjectionViaNode,
+  node: NodeWithPortPoints,
+) => {
+  const bounds = getInsetNodeBounds(node, via.radius + POSITION_EPSILON)
+  via.x = clampValue(via.x, bounds.minX, bounds.maxX)
+  via.y = clampValue(via.y, bounds.minY, bounds.maxY)
+}
+
+const collectProjectionViaNodes = (
+  routes: HighDensityRoute[],
+): ProjectionViaNode[] => {
+  const viaNodes: ProjectionViaNode[] = []
+
+  for (let routeIndex = 0; routeIndex < routes.length; routeIndex += 1) {
+    const route = routes[routeIndex]
+    if (!route) continue
+    const seenPointIndexes = new Set<number>()
+
+    for (let index = 0; index < route.route.length - 1; index += 1) {
+      const current = route.route[index]
+      const next = route.route[index + 1]
+      if (!current || !next) continue
+      if (current.z === next.z || !areSameXY(current, next)) {
+        continue
+      }
+
+      const pointIndexes = [index, index + 1]
+      for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+        const point = route.route[cursor]
+        if (!point || !areSameXY(point, current)) {
+          break
+        }
+        pointIndexes.push(cursor)
+      }
+      for (let cursor = index + 2; cursor < route.route.length; cursor += 1) {
+        const point = route.route[cursor]
+        if (!point || !areSameXY(point, current)) {
+          break
+        }
+        pointIndexes.push(cursor)
+      }
+
+      const uniquePointIndexes = [...new Set(pointIndexes)].sort(
+        (a, b) => a - b,
+      )
+      let overlapsSeenPoint = false
+      for (const pointIndex of uniquePointIndexes) {
+        if (seenPointIndexes.has(pointIndex)) {
+          overlapsSeenPoint = true
+          break
+        }
+      }
+      if (overlapsSeenPoint) {
+        continue
+      }
+      for (const pointIndex of uniquePointIndexes) {
+        seenPointIndexes.add(pointIndex)
+      }
+
+      viaNodes.push({
+        routeIndex,
+        rootConnectionName: getRouteRootConnectionName(route),
+        pointIndexes: uniquePointIndexes,
+        x: current.x,
+        y: current.y,
+        radius: (route.viaDiameter ?? VIA_DIAMETER) / 2,
+        movable:
+          !uniquePointIndexes.includes(0) &&
+          !uniquePointIndexes.includes(route.route.length - 1),
+      })
+    }
+  }
+
+  return viaNodes
+}
+
+const collectProjectionSegments = (
+  routes: HighDensityRoute[],
+): ProjectionSegment[] => {
+  const segments: ProjectionSegment[] = []
+
+  for (let routeIndex = 0; routeIndex < routes.length; routeIndex += 1) {
+    const route = routes[routeIndex]
+    if (!route) continue
+
+    for (let index = 0; index < route.route.length - 1; index += 1) {
+      const start = route.route[index]
+      const end = route.route[index + 1]
+      if (!start || !end) continue
+      if (start.z !== end.z || areSameXY(start, end)) {
+        continue
+      }
+
+      segments.push({
+        routeIndex,
+        rootConnectionName: getRouteRootConnectionName(route),
+        startIndex: index,
+        endIndex: index + 1,
+        start,
+        end,
+        z: start.z,
+        traceRadius: (route.traceThickness ?? 0.1) / 2,
+      })
+    }
+  }
+
+  return segments
+}
+
+const applyProjectionViaMove = (params: {
+  routes: HighDensityRoute[]
+  via: ProjectionViaNode
+  dx: number
+  dy: number
+  node: NodeWithPortPoints
+}) => {
+  const { routes, via, dx, dy, node } = params
+  if (!via.movable) return false
+
+  via.x += dx
+  via.y += dy
+  clampProjectionViaToNode(via, node)
+
+  const route = routes[via.routeIndex]
+  if (!route) return false
+  for (const pointIndex of via.pointIndexes) {
+    const point = route.route[pointIndex]
+    if (!point) continue
+    point.x = via.x
+    point.y = via.y
+  }
+
+  return true
+}
+
+const projectViaViaClearance = (params: {
+  routes: HighDensityRoute[]
+  node: NodeWithPortPoints
+  vias: ProjectionViaNode[]
+}) => {
+  const { routes, node, vias } = params
+  let changed = false
+
+  for (let leftIndex = 0; leftIndex < vias.length; leftIndex += 1) {
+    const left = vias[leftIndex]
+    if (!left) continue
+
+    for (
+      let rightIndex = leftIndex + 1;
+      rightIndex < vias.length;
+      rightIndex += 1
+    ) {
+      const right = vias[rightIndex]
+      if (!right) continue
+
+      const requiredDistance =
+        left.radius + right.radius + RELAXED_VIA_CLEARANCE + CLEARANCE_SLACK
+      const separationX = left.x - right.x
+      const separationY = left.y - right.y
+      const distance = Math.hypot(separationX, separationY)
+      const penetration = requiredDistance - distance
+      if (penetration <= 0) continue
+
+      const fallbackAngle =
+        (leftIndex * 97 + rightIndex * 13) * 1.618_033_988_75
+      const directionX =
+        distance > POSITION_EPSILON
+          ? separationX / distance
+          : Math.cos(fallbackAngle)
+      const directionY =
+        distance > POSITION_EPSILON
+          ? separationY / distance
+          : Math.sin(fallbackAngle)
+      const movableCount = Number(left.movable) + Number(right.movable)
+      if (movableCount === 0) continue
+
+      const move = Math.min(MAX_VIA_MOVE_PER_PASS, penetration / movableCount)
+      changed =
+        applyProjectionViaMove({
+          routes,
+          via: left,
+          dx: directionX * move,
+          dy: directionY * move,
+          node,
+        }) || changed
+      changed =
+        applyProjectionViaMove({
+          routes,
+          via: right,
+          dx: -directionX * move,
+          dy: -directionY * move,
+          node,
+        }) || changed
+    }
+  }
+
+  return changed
+}
+
+const projectViaSegmentClearance = (params: {
+  routes: HighDensityRoute[]
+  node: NodeWithPortPoints
+  vias: ProjectionViaNode[]
+  segments: ProjectionSegment[]
+}) => {
+  const { routes, node, vias, segments } = params
+  let changed = false
+
+  for (let viaIndex = 0; viaIndex < vias.length; viaIndex += 1) {
+    const via = vias[viaIndex]
+    if (!via?.movable) continue
+
+    for (const segment of segments) {
+      if (via.rootConnectionName === segment.rootConnectionName) continue
+
+      const projection = pointToProjectionSegment(via, segment)
+      const separationX = via.x - projection.x
+      const separationY = via.y - projection.y
+      const distance = Math.hypot(separationX, separationY)
+      const requiredDistance =
+        via.radius +
+        segment.traceRadius +
+        RELAXED_TRACE_CLEARANCE +
+        CLEARANCE_SLACK
+      const penetration = requiredDistance - distance
+      if (penetration <= 0) continue
+
+      const segmentX = segment.end.x - segment.start.x
+      const segmentY = segment.end.y - segment.start.y
+      const normalMagnitude = Math.hypot(segmentX, segmentY)
+      const fallbackSign = viaIndex % 2 === 0 ? 1 : -1
+      const directionX =
+        distance > POSITION_EPSILON
+          ? separationX / distance
+          : normalMagnitude > POSITION_EPSILON
+            ? (-segmentY / normalMagnitude) * fallbackSign
+            : 1
+      const directionY =
+        distance > POSITION_EPSILON
+          ? separationY / distance
+          : normalMagnitude > POSITION_EPSILON
+            ? (segmentX / normalMagnitude) * fallbackSign
+            : 0
+      const move = Math.min(MAX_VIA_MOVE_PER_PASS, penetration)
+
+      changed =
+        applyProjectionViaMove({
+          routes,
+          via,
+          dx: directionX * move,
+          dy: directionY * move,
+          node,
+        }) || changed
+    }
+  }
+
+  return changed
+}
+
+const applyProjectionRoutePointMove = (params: {
+  routes: HighDensityRoute[]
+  routeIndex: number
+  pointIndex: number
+  dx: number
+  dy: number
+  node: NodeWithPortPoints
+}) => {
+  const { routes, routeIndex, pointIndex, dx, dy, node } = params
+  const route = routes[routeIndex]
+  if (!route || pointIndex <= 0 || pointIndex >= route.route.length - 1) {
+    return false
+  }
+
+  const pointIndexes = getCoincidentPointIndexes(route.route, pointIndex)
+  if (
+    pointIndexes.includes(0) ||
+    pointIndexes.includes(route.route.length - 1)
+  ) {
+    return false
+  }
+
+  const bounds = getInsetNodeBounds(node, POSITION_EPSILON)
+  let changed = false
+  for (const candidateIndex of pointIndexes) {
+    const point = route.route[candidateIndex]
+    if (!point) continue
+    point.x = clampValue(point.x + dx, bounds.minX, bounds.maxX)
+    point.y = clampValue(point.y + dy, bounds.minY, bounds.maxY)
+    changed = true
+  }
+
+  return changed
+}
+
+const distributeProjectionSegmentMove = (params: {
+  routes: HighDensityRoute[]
+  segment: ProjectionSegment
+  dx: number
+  dy: number
+  node: NodeWithPortPoints
+  t: number
+}) => {
+  const { routes, segment, dx, dy, node, t } = params
+  const startWeight = 1 - clampUnitInterval(t)
+  const endWeight = clampUnitInterval(t)
+  const movedStart = applyProjectionRoutePointMove({
+    routes,
+    routeIndex: segment.routeIndex,
+    pointIndex: segment.startIndex,
+    dx: dx * startWeight,
+    dy: dy * startWeight,
+    node,
+  })
+  const movedEnd = applyProjectionRoutePointMove({
+    routes,
+    routeIndex: segment.routeIndex,
+    pointIndex: segment.endIndex,
+    dx: dx * endWeight,
+    dy: dy * endWeight,
+    node,
+  })
+
+  return movedStart || movedEnd
+}
+
+const projectSegmentSegmentClearance = (params: {
+  routes: HighDensityRoute[]
+  node: NodeWithPortPoints
+  segments: ProjectionSegment[]
+}) => {
+  const { routes, node, segments } = params
+  let changed = false
+
+  for (let leftIndex = 0; leftIndex < segments.length; leftIndex += 1) {
+    const left = segments[leftIndex]
+    if (!left) continue
+
+    for (
+      let rightIndex = leftIndex + 1;
+      rightIndex < segments.length;
+      rightIndex += 1
+    ) {
+      const right = segments[rightIndex]
+      if (
+        !right ||
+        left.z !== right.z ||
+        left.rootConnectionName === right.rootConnectionName
+      ) {
+        continue
+      }
+
+      const [candidate] = getProjectionSegmentDistanceCandidates(left, right)
+      if (!candidate) continue
+
+      const separationX = candidate.leftPoint.x - candidate.rightPoint.x
+      const separationY = candidate.leftPoint.y - candidate.rightPoint.y
+      const distance = Math.hypot(separationX, separationY)
+      const requiredDistance =
+        left.traceRadius +
+        right.traceRadius +
+        RELAXED_TRACE_CLEARANCE +
+        CLEARANCE_SLACK
+      const penetration = requiredDistance - distance
+      if (penetration <= 0) continue
+
+      const leftVectorX = left.end.x - left.start.x
+      const leftVectorY = left.end.y - left.start.y
+      const fallbackMagnitude = Math.hypot(leftVectorX, leftVectorY)
+      const fallbackSign = (leftIndex + rightIndex) % 2 === 0 ? 1 : -1
+      const directionX =
+        distance > POSITION_EPSILON
+          ? separationX / distance
+          : fallbackMagnitude > POSITION_EPSILON
+            ? (-leftVectorY / fallbackMagnitude) * fallbackSign
+            : 1
+      const directionY =
+        distance > POSITION_EPSILON
+          ? separationY / distance
+          : fallbackMagnitude > POSITION_EPSILON
+            ? (leftVectorX / fallbackMagnitude) * fallbackSign
+            : 0
+      const move = Math.min(MAX_TRACE_MOVE_PER_PASS, penetration / 2)
+
+      changed =
+        distributeProjectionSegmentMove({
+          routes,
+          segment: left,
+          dx: directionX * move,
+          dy: directionY * move,
+          node,
+          t: candidate.leftT,
+        }) || changed
+      changed =
+        distributeProjectionSegmentMove({
+          routes,
+          segment: right,
+          dx: -directionX * move,
+          dy: -directionY * move,
+          node,
+          t: candidate.rightT,
+        }) || changed
+    }
+  }
+
+  return changed
+}
+
+const applyProjectionClearance = (
+  node: NodeWithPortPoints,
+  routes: HighDensityRoute[],
+) => {
+  for (let pass = 0; pass < VIA_PROJECTION_PASSES; pass += 1) {
+    const vias = collectProjectionViaNodes(routes)
+    const segments = collectProjectionSegments(routes)
+    const viaToViaChanged = projectViaViaClearance({
+      routes,
+      node,
+      vias,
+    })
+    const viaToSegmentChanged = projectViaSegmentClearance({
+      routes,
+      node,
+      vias,
+      segments,
+    })
+    const segmentToSegmentChanged = projectSegmentSegmentClearance({
+      routes,
+      node,
+      segments,
+    })
+
+    if (!viaToViaChanged && !viaToSegmentChanged && !segmentToSegmentChanged) {
+      break
+    }
+  }
+
+  for (const route of routes) {
+    route.vias = deriveVias(route)
+  }
+
+  return routes
+}
 const resolveClearanceConstraints = (
   bounds: Bounds,
   mutableRoutes: MutableRoute[],
@@ -1514,6 +1995,7 @@ export class HighDensityForceImproveSolver extends BaseSolver {
       this.totalStepsPerNode,
       { includeForceVectors: true },
     )
+    applyProjectionClearance(sampleEntry.node, result.routes)
 
     for (let i = 0; i < sampleEntry.routeIndexes.length; i++) {
       this.improvedRoutesByIndex.set(
